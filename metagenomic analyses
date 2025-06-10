@@ -1,0 +1,106 @@
+######METAGENOMIC SEQUENCING: SHORT-READ ASSEMBLY, MAPPING AND MAG RECONSTRUCTION USING ANVI'O#####
+###The workflow and code used, except blasts against specific databases, are all part of anvi'o (see the official website for more information): https://anvio.org/ 
+
+###Before starting: put fastq pair-end read files in a folder named 00_RAW and a create a .txt file that contains sample names in the first column, the pathway to R1 files in the second column and the pathway to R2 files in the third column.
+
+conda activate anvio-8
+
+###Step 1: quality control of short-reads using the criteria described by Minoche et al.
+mkdir 01_QC
+iu-gen-configs samples.txt -o 01_QC
+ls 01_QC/
+Sample_01.ini
+Sample_02.ini
+for ini in 01_QC/*.ini; do iu-filter-quality-minoche $ini; done
+
+###Step 2: metagenomic short-read assembly using MEGAHIT (one assembly per drug - 27 samples + 9 controls per assembly, four different assemblies for chlorpromazine, diclofenac, diphenhydramine and fluoxetine)
+###Example for chlorpromazine (CMZ)
+cd 01_QC_CMZ
+cat *R1.fastq > R1.fastq
+cat *R2.fastq > R2.fastq
+gzip R*.fastq
+megahit -1 R1.fastq.gz -2 R2.fastq.gz --min-contig-len 1000 -o /NADs/megahit -t 16 --k-list 21,41,61,81,99
+cd ../
+cd megahit  
+anvi-script-reformat-fasta final.contigs.fa -o contigs.fa --simplify-names --report-file rename.txt
+
+####Step 3: mapping of short reads onto contigs using Bowtie2 (example for chlorpromazine):
+cd ../
+NUM_THREADS=16
+names='D0_C1_MG D0_C2_MG D0_C3_MG D0_CMZl1_MG D0_CMZl2_MG D0_CMZl3_MG D0_CMZh1_MG D0_CMZh2_MG D0_CMZh3_MG D2_C1_MG D2_C2_MG D2_C3_MG D2_CMZl1_MG D2_CMZl2_MG D2_CMZl3_MG D2_CMZh1_MG D2_CMZh2_MG D2_CMZh3_MG D8_C1_MG D8_C2_MG D8_C3_MG D8_CMZl1_MG D8_CMZl2_MG D8_CMZl3_MG D8_CMZh1_MG D8_CMZh2_MG D8_CMZh3_MG'
+
+mkdir 04_MAPPING
+bowtie2-build megahit/contigs.fa 04_MAPPING/contigs
+
+for sample in $names
+do
+bowtie2 --threads $NUM_THREADS -x 04_MAPPING/contigs -1 /NADs/01_QC_CMZ/${sample}-QUALITY_PASSED_R1.fastq -2 /NADs/01_QC_CMZ/${sample}-QUALITY_PASSED_R2.fastq --no-unal -S 04_MAPPING/$sample.sam
+samtools view -F 4 -bS 04_MAPPING/$sample.sam > 04_MAPPING/$sample-RAW.bam
+anvi-init-bam 04_MAPPING/$sample-RAW.bam -o 04_MAPPING/$sample.bam
+rm 04_MAPPING/$sample.sam 04_MAPPING/$sample-RAW.bam
+done
+
+###Step 4: create a contig database from the contig file
+anvi-gen-contigs-database -f /NADs/megahit/contigs.fa -o contigs.db -n 'NADs_MG'
+
+#####Hidden Markov models: utilize multiple default bacterial single-copy core gene collections and identify hits among your genes to those collections using HMMER
+anvi-run-hmms -c contigs.db --num-threads 16
+
+####Gene annotation with previously downloaded databases: the CARD database (antibiotic resistance genes), the mobileOG database (mobile genetic elements) and the virulence factor database (virulence genes).
+##Example for the CARD database
+diamond blastx --db /databases/card.dmnd --query contigs.fa --evalue 0.00001 --out /card/card_contigs.txt -p 16 
+awk '$3>=60 && $4>=150 {print;} card_contigs.txt > filtered_card.txt
+awk '!x[$1]++' filtered_card.txt > besthit_card.txt
+
+####Taxonomy assignation using Centrifuge:
+anvi-run-scg-taxonomy -c contigs.db
+
+
+####Step 5: Create individual profiles for each sample
+names='D0_C1_MG D0_C2_MG D0_C3_MG D0_CMZl1_MG D0_CMZl2_MG D0_CMZl3_MG D0_CMZh1_MG D0_CMZh2_MG D0_CMZh3_MG D2_C1_MG D2_C2_MG D2_C3_MG D2_CMZl1_MG D2_CMZl2_MG D2_CMZl3_MG D2_CMZh1_MG D2_CMZh2_MG D2_CMZh3_MG D8_C1_MG D8_C2_MG D8_C3_MG D8_CMZl1_MG D8_CMZl2_MG D8_CMZl3_MG D8_CMZh1_MG D8_CMZh2_MG D8_CMZh3_MG'
+mkdir 05_PROFILES
+for sample in $names ; do anvi-profile -c contigs.db -i 04_MAPPING/$sample.bam --sample-name $sample --min-contig-length 1000 --output-dir 05_PROFILES/$sample ; done 
+
+###Step 6: Merge profiles
+mv contigs.db 05_PROFILES
+cd 05_PROFILES
+anvi-merge */PROFILE.db -o SAMPLES-MERGED -c contigs.db --enforce-hierarchical-clustering
+
+#####Binning using CONCOCT:
+cut_up_fasta.py original_contigs.fa -c 10000 -o 0 --merge_last -b contigs_10K.bed > contigs_10K.fa
+concoct_coverage_table.py contigs_10K.bed mapping/Sample*.sorted.bam > coverage_table.tsv
+concoct --composition_file contigs_10K.fa --coverage_file coverage_table.tsv -b concoct_output/
+merge_cutup_clustering.py concoct_output/clustering_gt1000.csv > concoct_output/clustering_merged.csv
+###From the file clustering_merged.csv, extract contig number and bin number to create a two-colum concoct.txt file to import into anvi'o:
+anvi-import-collection concoct.txt -p PROFILE.db -c contigs.db -C concoct_bins
+###Refine bins from CONCOCT using anvi'o to satisfy quality criteria (completion >50% redundancy <10%) (-C name of the bin collection, -b name of the bin):
+anvi-refine -p PROFILE.db -c contigs.db -C bins -b Bin_1
+###Refined bins are stored manually based on differential coverage and sequence composition using the interactive platform and summarized using:
+anvi-summarize -c contigs.db -p PROFILE.db -C bins
+##The summary generated contains all the relevant information (MAG abundance, ARG/MGE/VF content, completion, redundancy, taxonomy...) that was used in this study. Plots were obtained using GraphPad Prism 9
+
+
+
+####Creation of ARG/MGE bins to determine contig percentage of recruitment.
+###Creation of bins only with contigs containing ARGs (for instance) from the table obtained from blasting the contig file against the CARD database. Make a file with two columns: one with contig names and one with ARG name
+c_000000026967	aadA2
+c_00000003789	qnrB22
+
+##Import the file in anvi'o to generate a bin collection:
+
+anvi-import-collection ARGs_contigs.txt -p PROFILE.db -c contigs.db -C ARG_collection
+###Now you can work with the bin collection in the anvi'o interactive web (using anvi-interactive to merge by class for example). To get percentage of recruitments use anvi-summarize and look for the percent_recruitment file in the generated folder.
+###Using anvi'o interactive, the co-occurrence of ARGs, MGE and virulence genes in the same contig can also be identified.
+
+
+############NMDS and PERMANOVA###########
+library(readr)
+relab <- read_table("mags.txt")
+metadata <- read_table("metadata.txt")  ###metadata include sampling day, condition and replicate
+library(vegan)
+NMDS <- metaMDS(relab,distance = "bray")
+NMDS
+NMDS[["points"]]
+
+#Permanova test
+adonis2(relab ~ temperature*time, data = metadata)
